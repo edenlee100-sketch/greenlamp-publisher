@@ -86,17 +86,7 @@ export function AuthProvider({ children }) {
   // without triggering any state updates or consumer re-renders.
   const authedUserIdRef = useRef(null)
 
-  // Role supplied out-of-band by the user switcher, which already learned it
-  // from the backend. Lets the switch path skip the RLS-guarded profiles query
-  // entirely — that query contends with the auth lock during setSession and is
-  // the slow, failure-prone step.
-  const roleHintRef = useRef(null)   // { userId, role }
-
-  const primeRole = useCallback((userId, role) => {
-    if (userId && role) roleHintRef.current = { userId, role }
-  }, [])
-
-  const fetchRoleOnce = async (userId) => {
+  const fetchRole = async (userId) => {
     try {
       const result = await Promise.race([
         supabase.from('profiles').select('role').eq('id', userId).single(),
@@ -105,94 +95,40 @@ export function AuthProvider({ children }) {
         ),
       ])
       const { data, error } = result
-      if (error) return { role: null, error }
-      return { role: data?.role ?? null, error: null }
-    } catch (err) {
-      return { role: null, error: err }
+      if (error) return null
+      return data?.role ?? null
+    } catch {
+      return null
     }
-  }
-
-  // A null role bounces the user to /login, so one transient failure must not
-  // decide it. Retry once — this also covers the window just after a user
-  // switch, where the first query can still carry the previous access token
-  // and return no rows under RLS.
-  const fetchRole = async (userId) => {
-    const first = await fetchRoleOnce(userId)
-    if (first.role) return first.role
-    if (first.error) console.warn('[auth] role lookup failed, retrying:', first.error)
-    await new Promise(r => setTimeout(r, 600))
-    const second = await fetchRoleOnce(userId)
-    if (!second.role) {
-      console.error('[auth] role lookup failed after retry:', second.error)
-    }
-    return second.role
   }
 
   useEffect(() => {
     let mounted = true
 
-    // IMPORTANT: this callback must stay synchronous and must not call any
-    // supabase.* API directly.
-    //
-    // supabase-js invokes state-change subscribers from inside its auth lock
-    // (_acquireLock -> _notifyAllSubscribers) and AWAITS each callback. Any
-    // Supabase call made here re-enters that lock — every DB query resolves its
-    // token via auth.getSession() — and the re-entrant call queues behind the
-    // very callback the lock is waiting on. That deadlocks until
-    // lockAcquireTimeout, which previously surfaced as the switcher hanging and
-    // then logging the user out when the role lookup timed out to null.
-    //
-    // Deferring with setTimeout(0) lets the callback return, releases the lock,
-    // and runs the work on a clean tick.
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
+      async (_event, session) => {
         if (!mounted) return
 
         if (session?.user) {
-          const userId    = session.user.id
+          const userId   = session.user.id
           const isNewUser = userId !== authedUserIdRef.current
 
           if (isNewUser) {
-            // Genuine new login, user switch, or first page load.
+            // Genuine new login or first page load — update user and fetch role.
             authedUserIdRef.current = userId
             setUser(session.user)
 
-            setTimeout(async () => {
-              if (!mounted) return   // stale mount (StrictMode)
+            const r = await fetchRole(userId)
+            if (!mounted) return   // stale mount (StrictMode) — the live mount handles it
+            setRole(r)
 
-              // Fast path: the switcher already told us this user's role.
-              const hint = roleHintRef.current
-              let r = hint && hint.userId === userId ? hint.role : null
-              if (r) {
-                console.log('[auth] using role supplied by switcher:', r)
-                roleHintRef.current = null
-              } else {
-                r = await fetchRole(userId)
-              }
-              if (!mounted) return
-
-              if (r) {
-                setRole(r)
-              } else {
-                // A failed lookup must NOT sign the user out. We hold a valid
-                // session, so nulling the role here would send ProtectedRoute
-                // to /login even though authentication succeeded.
-                console.error(
-                  '[auth] could not resolve role for the signed-in user; ' +
-                  'keeping the session and leaving the previous role in place.'
-                )
-              }
-              // Only now is auth state complete — keep `loading` true until the
-              // role is settled, or ProtectedRoute sees role=null and bounces.
-              setLoading(false)
-
-              // Background, non-blocking.
-              registerPush(userId)
-            }, 0)
-          } else {
-            // Same user (TOKEN_REFRESHED, etc.) — user/role already correct.
-            setLoading(false)
+            // Register push subscription in the background — non-blocking
+            registerPush(userId)
           }
+          // If same user (TOKEN_REFRESHED, etc.) skip all state updates.
+          // user/role are already correct; no re-render needed.
+
+          setLoading(false)
         } else {
           // Signed out
           authedUserIdRef.current = null
@@ -237,8 +173,8 @@ export function AuthProvider({ children }) {
   // Stable as long as loading/role/signOut don't change — TOKEN_REFRESHED won't
   // touch any of these, so page components won't re-render.
   const authValue = useMemo(
-    () => ({ loading, role, signOut, primeRole }),
-    [loading, role, signOut, primeRole]
+    () => ({ loading, role, signOut }),
+    [loading, role, signOut]
   )
 
   // profileValue: consumed only by the topbar (Layout).
