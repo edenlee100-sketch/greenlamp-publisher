@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
@@ -23,7 +23,6 @@ from scraper.email_notifications import (  # noqa: E402
     send_email_to_roles,
     send_retainer_email,
     resolve_role_emails,
-    env_role_email,
     resolve_retainer_email,
     sender_email,
 )
@@ -584,65 +583,140 @@ async def notify(req: NotifyRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── User switcher (Or only) ───────────────────────────────────────────────────
+# ── User switcher ─────────────────────────────────────────────────────────────
 
-# Allow-list — accounts that can be switched into via admin session
-def _switch_targets() -> set[str]:
-    # Deliberately env/default-only (env_role_email, not role_emails): the top-bar
-    # switcher stays pinned to the three original accounts and must NOT follow
-    # dynamic user management. resolve_* avoids emitting a "[retainer]" log line
-    # during an unrelated login check.
-    return {
-        env_role_email("or"),
-        env_role_email("denise"),
-        resolve_retainer_email()[0],
-    }
+# Human-readable role names, used in switcher error messages.
+ROLE_DISPLAY = {"or": "Or", "denise": "Denise", "publisher": "Publisher"}
+
+# Which roles each role may switch into. Mirrors the top-bar UI.
+SWITCH_GRAPH: dict[str, set[str]] = {
+    "or":        {"denise", "publisher"},
+    "denise":    {"or"},
+    "publisher": {"or"},
+}
+
+
+def _first_user_for_role(sb, role: str) -> dict | None:
+    """
+    The account the switcher should land on for a role: the oldest profile
+    holding it. Returns None when nobody has that role.
+    """
+    resp = (
+        sb.from_("profiles")
+          .select("id, email, created_at")
+          .eq("role", role)
+          .order("created_at", desc=False)
+          .limit(1)
+          .execute()
+    )
+    rows = resp.data or []
+    return rows[0] if rows else None
+
+
+def _caller_role(sb, authorization: str | None) -> str | None:
+    """
+    Resolve the role of the caller from their Supabase access token.
+
+    Returns None if the token is missing, invalid, or has no profile — the
+    caller is then treated as unauthenticated.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        user_resp = sb.auth.get_user(token)
+        user = getattr(user_resp, "user", None)
+        if user is None:
+            return None
+        prof = sb.from_("profiles").select("role").eq("id", user.id).execute()
+        rows = prof.data or []
+        return (rows[0].get("role") or "").strip() if rows else None
+    except Exception as e:
+        print(f"[switch-user] could not verify caller token: {e}")
+        return None
+
 
 class SwitchUserRequest(BaseModel):
-    target_email: str
+    # Roles are resolved at click time so the switcher follows dynamic user
+    # management. target_email is retained only so a frontend deployed before
+    # the backend keeps working during a rollout.
+    target_role:  str | None = None
+    target_email: str | None = None
 
 
 @app.post("/api/admin/switch-user")
-async def switch_user(req: SwitchUserRequest):
+async def switch_user(req: SwitchUserRequest, authorization: str | None = Header(default=None)):
     """
-    Instantly create a session for a target user without a login screen:
+    Create a session for a user holding `target_role`, without a password:
       1. admin.generate_link(magiclink) → hashed_token  (no email sent)
       2. auth.verify_otp(token_hash)    → real session   (server-side redemption)
     Returns access_token + refresh_token; frontend calls setSession() directly.
-    Only allows switching to the hard-coded allow-list above.
-    """
-    print(f"[switch-user] received request for target_email={req.target_email!r}")
-    if req.target_email not in _switch_targets():
-        print(f"[switch-user] REJECTED — not in allow-list")
-        raise HTTPException(status_code=403, detail="Not an allowed switch target.")
-    try:
-        sb = _sb()
 
+    The caller must present their own Supabase access token, and may only
+    switch into roles allowed by SWITCH_GRAPH for their own role.
+    """
+    sb = _sb()
+
+    caller_role = await run_in_threadpool(_caller_role, sb, authorization)
+    if caller_role is None:
+        raise HTTPException(status_code=401, detail="Sign in again to switch users.")
+
+    target_role = (req.target_role or "").strip()
+
+    # Backwards compatibility: older frontends sent an email instead of a role.
+    if not target_role and req.target_email:
+        lookup = await run_in_threadpool(
+            lambda: sb.from_("profiles").select("role").eq("email", req.target_email.strip()).execute()
+        )
+        rows = lookup.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="That user no longer exists.")
+        target_role = (rows[0].get("role") or "").strip()
+
+    if target_role not in SWITCH_GRAPH:
+        raise HTTPException(status_code=422, detail=f"Unknown target role {target_role!r}.")
+
+    allowed = SWITCH_GRAPH.get(caller_role, set())
+    if target_role not in allowed:
+        print(f"[switch-user] REJECTED — {caller_role!r} may not switch to {target_role!r}")
+        raise HTTPException(status_code=403, detail="You cannot switch to that role.")
+
+    target = await run_in_threadpool(_first_user_for_role, sb, target_role)
+    if not target or not target.get("email"):
+        label = ROLE_DISPLAY.get(target_role, target_role)
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {label} user exists yet. Add one on the Users page first.",
+        )
+
+    target_email = target["email"]
+    print(f"[switch-user] {caller_role!r} → {target_role!r} ({target_email})")
+    try:
         # Step 1: generate the OTP — admin API, no email is dispatched
-        print(f"[switch-user] calling generate_link for {req.target_email!r}")
         link_resp = await run_in_threadpool(
             sb.auth.admin.generate_link,
-            {"type": "magiclink", "email": req.target_email},
+            {"type": "magiclink", "email": target_email},
         )
         hashed_token = link_resp.properties.hashed_token
-        print(f"[switch-user] got hashed_token: {bool(hashed_token)}")
 
         # Step 2: redeem the token server-side to get a real session
-        print(f"[switch-user] calling verify_otp")
         session_resp = await run_in_threadpool(
             sb.auth.verify_otp,
             {"token_hash": hashed_token, "type": "magiclink"},
         )
 
         session = session_resp.session
-        print(f"[switch-user] session present: {bool(session)}")
         if not session:
             raise ValueError(f"verify_otp returned no session (response: {session_resp!r})")
 
-        print(f"[switch-user] success — returning tokens for {req.target_email!r}")
+        print(f"[switch-user] success — returning tokens for {target_email!r}")
         return {
             "access_token":  session.access_token,
             "refresh_token": session.refresh_token,
+            "email":         target_email,
+            "role":          target_role,
         }
     except HTTPException:
         raise

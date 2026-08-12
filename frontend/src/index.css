@@ -172,8 +172,33 @@ body {
   font-weight: 700;
   color: #dc2626;
   cursor: default;
-  title: attr(title);
 }
+
+/* Readable inline reason, replacing the old bare "!" indicator. */
+.user-switch-message {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: #991b1b;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+.user-switch-dismiss {
+  border: none;
+  background: transparent;
+  color: #991b1b;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.user-switch-dismiss:hover { color: #7f1d1d; }
 
 /* ── App shell (authenticated views) ── */
 .app-shell {
