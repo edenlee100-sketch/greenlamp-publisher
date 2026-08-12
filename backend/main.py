@@ -23,7 +23,7 @@ from scraper.email_notifications import (  # noqa: E402
     send_email_to_roles,
     send_retainer_email,
     role_emails,
-    retainer_email,
+    resolve_retainer_email,
     sender_email,
 )
 from scraper.bulk_price_check import check_prices_bulk                                            # noqa: E402
@@ -74,7 +74,8 @@ async def lifespan(app: FastAPI):
     print(f"[startup] OR_EMAIL        = {_roles['or']}        {'(env)' if os.environ.get('OR_EMAIL')        else '(default)'}")
     print(f"[startup] PUBLISHER_EMAIL = {_roles['publisher']} {'(env)' if os.environ.get('PUBLISHER_EMAIL') else '(default)'}")
     print(f"[startup] DENISE_EMAIL    = {_roles['denise']}    {'(env)' if os.environ.get('DENISE_EMAIL')    else '(default)'}")
-    print(f"[startup] RETAINER_EMAIL  = {retainer_email()}    {'(env)' if os.environ.get('RETAINER_EMAIL')  else '(default)'}")
+    _retainer, _retainer_src = resolve_retainer_email()
+    print(f"[startup] RETAINER_EMAIL  = {_retainer}    ({_retainer_src})")
     print(f"[startup] email sender    = {sender_email()}")
     yield
     scheduler.shutdown(wait=False)
@@ -587,7 +588,9 @@ async def notify(req: NotifyRequest, background_tasks: BackgroundTasks):
 # Allow-list — accounts that can be switched into via admin session
 def _switch_targets() -> set[str]:
     roles = role_emails()
-    return {roles["or"], roles["denise"], retainer_email()}
+    # resolve_* rather than retainer_email() so an unrelated login check does not
+    # emit a "[retainer] email = …" line into the logs.
+    return {roles["or"], roles["denise"], resolve_retainer_email()[0]}
 
 class SwitchUserRequest(BaseModel):
     target_email: str

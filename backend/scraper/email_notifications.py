@@ -39,8 +39,78 @@ def role_emails() -> dict[str, str]:
     }
 
 
+SETTINGS_RETAINER_KEY = "retainer_email"
+
+
+def _setting_from_supabase(key: str) -> str | None:
+    """
+    Read a single value from the public.settings table.
+
+    Returns the trimmed value, or None if it is unavailable for ANY reason
+    (missing env config, network error, absent row, RLS refusal, blank value).
+    Never raises — callers rely on falling back to env/default.
+    """
+    try:
+        url = os.environ.get("SUPABASE_URL")
+        # Service-role key bypasses RLS, so backend reads are unaffected by policies.
+        svc = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not svc:
+            return None
+
+        from supabase import create_client
+
+        resp = (
+            create_client(url, svc)
+            .table("settings")
+            .select("value")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return None
+        return (rows[0].get("value") or "").strip() or None
+    except Exception as e:
+        print(f"[settings] could not read {key!r} from settings table: {e}")
+        return None
+
+
+def resolve_retainer_email() -> tuple[str, str]:
+    """
+    Resolve the retainer recipient, in priority order:
+      1. public.settings row where key = 'retainer_email'  (editable from the UI)
+      2. RETAINER_EMAIL environment variable
+      3. hardcoded DEFAULT_RETAINER_EMAIL
+
+    Returns (address, source). Never raises — a failure here would otherwise
+    stop retainer emails from being sent at all.
+    """
+    # Belt-and-braces: _setting_from_supabase already swallows its own errors,
+    # but this outer guard means no future change in that path can ever stop a
+    # retainer email from being addressed.
+    try:
+        value = _setting_from_supabase(SETTINGS_RETAINER_KEY)
+        if value:
+            return value, "from settings table"
+    except Exception as e:
+        print(f"[retainer] settings lookup failed, falling back: {e}")
+
+    try:
+        env_value = (os.environ.get("RETAINER_EMAIL") or "").strip()
+        if env_value:
+            return env_value, "from env"
+    except Exception as e:
+        print(f"[retainer] env lookup failed, falling back: {e}")
+
+    return DEFAULT_RETAINER_EMAIL, "from default"
+
+
 def retainer_email() -> str:
-    return _env("RETAINER_EMAIL", DEFAULT_RETAINER_EMAIL)
+    """Resolved retainer recipient, logging which source supplied it."""
+    addr, source = resolve_retainer_email()
+    print(f"[retainer] email = {addr} ({source})")
+    return addr
 
 
 def sender_email() -> str:

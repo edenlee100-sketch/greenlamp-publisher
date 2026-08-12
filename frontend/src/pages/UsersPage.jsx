@@ -1,9 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { supabase } from '../lib/supabase'
 import Layout from '../components/Layout'
 
 const API_BASE = 'https://greenlamp-publisher-production-75fd.up.railway.app'
+
+const RETAINER_SETTING_KEY = 'retainer_email'
 
 const ROLE_LABEL = {
   or:        'Or',
@@ -22,6 +25,13 @@ export default function UsersPage() {
   const [saving,      setSaving]      = useState(false)
   const [saveError,   setSaveError]   = useState('')
   const [saveSuccess, setSaveSuccess] = useState('')     // email of last success
+
+  // ── Retainer email setting (settings table, key = 'retainer_email') ──
+  const [retainer,        setRetainer]        = useState('')
+  const [retainerLoaded,  setRetainerLoaded]  = useState(false)
+  const [retainerSaving,  setRetainerSaving]  = useState(false)
+  const [retainerError,   setRetainerError]   = useState('')
+  const [retainerSaved,   setRetainerSaved]   = useState(false)
 
   // Guard — only Or may access this page
   useEffect(() => {
@@ -46,6 +56,68 @@ export default function UsersPage() {
       })
       .catch(() => setLoadError('Failed to load users.'))
   }, [role])
+
+  // Load the current retainer email from the settings table
+  useEffect(() => {
+    if (role !== 'or') return
+    let cancelled = false
+    supabase
+      .from('settings')
+      .select('value')
+      .eq('key', RETAINER_SETTING_KEY)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return
+        if (error) {
+          setRetainerError('Could not load the current retainer email.')
+        } else {
+          setRetainer(data?.value ?? '')
+        }
+        setRetainerLoaded(true)
+      })
+    return () => { cancelled = true }
+  }, [role])
+
+  // Auto-dismiss the brief success confirmation
+  useEffect(() => {
+    if (!retainerSaved) return
+    const t = setTimeout(() => setRetainerSaved(false), 3000)
+    return () => clearTimeout(t)
+  }, [retainerSaved])
+
+  async function saveRetainer(e) {
+    e.preventDefault()
+    const value = retainer.trim()
+    setRetainerError('')
+    setRetainerSaved(false)
+
+    if (!value) { setRetainerError('Enter an email address.'); return }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      setRetainerError('Enter a valid email address.'); return
+    }
+
+    setRetainerSaving(true)
+    try {
+      // .select() so we can tell an RLS-blocked / missing-row no-op from a real
+      // update — without it Supabase reports success even when nothing changed.
+      const { data, error } = await supabase
+        .from('settings')
+        .update({ value })
+        .eq('key', RETAINER_SETTING_KEY)
+        .select('key')
+
+      if (error) throw new Error(error.message)
+      if (!data || data.length === 0) {
+        throw new Error('Nothing was updated — the setting row may be missing.')
+      }
+      setRetainer(value)
+      setRetainerSaved(true)
+    } catch (err) {
+      setRetainerError(err.message || 'Could not save.')
+    } finally {
+      setRetainerSaving(false)
+    }
+  }
 
   function openForm(userId) {
     setActiveId(userId)
@@ -147,6 +219,38 @@ export default function UsersPage() {
           </div>
         ))}
       </div>
+
+      <section className="settings-section">
+        <h2 className="settings-heading">Retainer Email</h2>
+        <p className="settings-hint">
+          "Please add to retainer" emails are sent to this address.
+        </p>
+
+        {retainerSaved && (
+          <p className="users-success">✓ Retainer email updated</p>
+        )}
+
+        <form className="retainer-form" onSubmit={saveRetainer}>
+          <input
+            type="email"
+            className="pw-input"
+            placeholder={retainerLoaded ? 'name@example.com' : 'Loading…'}
+            value={retainer}
+            onChange={e => { setRetainer(e.target.value); setRetainerError('') }}
+            disabled={!retainerLoaded || retainerSaving}
+          />
+          {retainerError && <span className="pw-error">{retainerError}</span>}
+          <div className="pw-actions">
+            <button
+              type="submit"
+              className="btn-primary pw-save"
+              disabled={!retainerLoaded || retainerSaving}
+            >
+              {retainerSaving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </form>
+      </section>
     </Layout>
   )
 }
