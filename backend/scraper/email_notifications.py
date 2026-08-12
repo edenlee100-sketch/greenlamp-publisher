@@ -30,13 +30,113 @@ def _env(name: str, default: str) -> str:
     return (os.environ.get(name) or "").strip() or default
 
 
-def role_emails() -> dict[str, str]:
-    """Resolved role → address map. Read at call time so env changes take effect."""
-    return {
-        "or":        _env("OR_EMAIL",        DEFAULT_OR_EMAIL),
-        "publisher": _env("PUBLISHER_EMAIL", DEFAULT_PUBLISHER_EMAIL),
-        "denise":    _env("DENISE_EMAIL",    DEFAULT_DENISE_EMAIL),
-    }
+ROLES = ("or", "publisher", "denise")
+
+# Role → (env var, hardcoded default) used for the fallback chain.
+_ROLE_FALLBACKS: dict[str, tuple[str, str]] = {
+    "or":        ("OR_EMAIL",        DEFAULT_OR_EMAIL),
+    "publisher": ("PUBLISHER_EMAIL", DEFAULT_PUBLISHER_EMAIL),
+    "denise":    ("DENISE_EMAIL",    DEFAULT_DENISE_EMAIL),
+}
+
+
+def env_role_email(role: str) -> str:
+    """
+    The single env/default address for a role, ignoring the profiles table.
+
+    Used by the user switcher, which must keep pointing at the three original
+    accounts rather than following dynamic user management.
+    """
+    env_var, default = _ROLE_FALLBACKS[role]
+    return _env(env_var, default)
+
+
+def _profiles_emails_by_role() -> dict[str, list[str]] | None:
+    """
+    Read every profile and group the emails by role.
+
+    Returns None if the table is unavailable for ANY reason (missing env config,
+    network error, RLS refusal). Never raises — callers fall back to env/default.
+    """
+    try:
+        url = os.environ.get("SUPABASE_URL")
+        # Service-role key bypasses RLS, so backend reads see every profile.
+        svc = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not svc:
+            return None
+
+        from supabase import create_client
+
+        resp = (
+            create_client(url, svc)
+            .table("profiles")
+            .select("email, role")
+            .execute()
+        )
+        rows = resp.data or []
+
+        grouped: dict[str, list[str]] = {r: [] for r in ROLES}
+        for row in rows:
+            role  = (row.get("role")  or "").strip()
+            email = (row.get("email") or "").strip()
+            if role in grouped and email and email not in grouped[role]:
+                grouped[role].append(email)
+        return grouped
+    except Exception as e:
+        print(f"[roles] could not read profiles table: {e}")
+        return None
+
+
+def resolve_role_emails() -> tuple[dict[str, list[str]], dict[str, str]]:
+    """
+    Resolve every role to a LIST of recipients, in priority order per role:
+      1. all profiles rows with that role   (managed from the Users page)
+      2. the role's environment variable    (OR_EMAIL / PUBLISHER_EMAIL / …)
+      3. the hardcoded default
+
+    Returns (role -> [emails], role -> source). Never raises.
+
+    A role with no profiles rows falls back to env/default rather than resolving
+    to nobody, so deleting users can never silently black-hole notifications.
+    """
+    try:
+        grouped = _profiles_emails_by_role()
+    except Exception as e:
+        print(f"[roles] profiles lookup failed, falling back: {e}")
+        grouped = None
+
+    resolved: dict[str, list[str]] = {}
+    sources:  dict[str, str] = {}
+
+    for role in ROLES:
+        from_table = (grouped or {}).get(role) or []
+        if from_table:
+            resolved[role] = from_table
+            sources[role]  = "from profiles table"
+            continue
+
+        env_var, default = _ROLE_FALLBACKS[role]
+        try:
+            env_value = (os.environ.get(env_var) or "").strip()
+        except Exception:
+            env_value = ""
+
+        if env_value:
+            resolved[role] = [env_value]
+            sources[role]  = "from env"
+        else:
+            resolved[role] = [default]
+            sources[role]  = "from default"
+
+    return resolved, sources
+
+
+def role_emails() -> dict[str, list[str]]:
+    """Resolved role → list of recipient addresses, logging the source per role."""
+    resolved, sources = resolve_role_emails()
+    for role in ROLES:
+        print(f"[roles] {role} = {', '.join(resolved[role])} ({sources[role]})")
+    return resolved
 
 
 SETTINGS_RETAINER_KEY = "retainer_email"
@@ -147,10 +247,17 @@ def send_email_to_roles(
         return
 
     resolved = role_emails()
-    to_emails = [resolved[r] for r in roles if r in resolved]
+    # Every user holding a requested role gets the email. Dedupe across roles so
+    # an address appearing under two roles is not mailed twice.
+    to_emails: list[str] = []
+    for r in roles:
+        for addr in resolved.get(r, []):
+            if addr not in to_emails:
+                to_emails.append(addr)
     if not to_emails:
         print(f"[email] no addresses mapped for roles {roles!r} — skipping")
         return
+    print(f"[email] roles {roles!r} → {len(to_emails)} recipient(s): {', '.join(to_emails)}")
 
     # Build extra link buttons for HTML
     extra_html = ""

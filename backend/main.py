@@ -22,7 +22,8 @@ from scraper.reminder_checker import check_stale_articles    # noqa: E402
 from scraper.email_notifications import (  # noqa: E402
     send_email_to_roles,
     send_retainer_email,
-    role_emails,
+    resolve_role_emails,
+    env_role_email,
     resolve_retainer_email,
     sender_email,
 )
@@ -70,10 +71,10 @@ async def lifespan(app: FastAPI):
     print(f"[startup] CORS_ORIGINS={_CORS_ORIGINS}")
     # Print the values the email module actually resolves, so the log can never
     # drift from the addresses real emails are sent to.
-    _roles = role_emails()
-    print(f"[startup] OR_EMAIL        = {_roles['or']}        {'(env)' if os.environ.get('OR_EMAIL')        else '(default)'}")
-    print(f"[startup] PUBLISHER_EMAIL = {_roles['publisher']} {'(env)' if os.environ.get('PUBLISHER_EMAIL') else '(default)'}")
-    print(f"[startup] DENISE_EMAIL    = {_roles['denise']}    {'(env)' if os.environ.get('DENISE_EMAIL')    else '(default)'}")
+    _role_map, _role_sources = resolve_role_emails()
+    for _role in ("or", "publisher", "denise"):
+        _addrs = ", ".join(_role_map[_role])
+        print(f"[startup] {_role:<9} recipients = {_addrs}    ({_role_sources[_role]})")
     _retainer, _retainer_src = resolve_retainer_email()
     print(f"[startup] RETAINER_EMAIL  = {_retainer}    ({_retainer_src})")
     print(f"[startup] email sender    = {sender_email()}")
@@ -587,10 +588,15 @@ async def notify(req: NotifyRequest, background_tasks: BackgroundTasks):
 
 # Allow-list — accounts that can be switched into via admin session
 def _switch_targets() -> set[str]:
-    roles = role_emails()
-    # resolve_* rather than retainer_email() so an unrelated login check does not
-    # emit a "[retainer] email = …" line into the logs.
-    return {roles["or"], roles["denise"], resolve_retainer_email()[0]}
+    # Deliberately env/default-only (env_role_email, not role_emails): the top-bar
+    # switcher stays pinned to the three original accounts and must NOT follow
+    # dynamic user management. resolve_* avoids emitting a "[retainer]" log line
+    # during an unrelated login check.
+    return {
+        env_role_email("or"),
+        env_role_email("denise"),
+        resolve_retainer_email()[0],
+    }
 
 class SwitchUserRequest(BaseModel):
     target_email: str
@@ -695,3 +701,157 @@ async def list_users():
         return {"users": users}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Dynamic user management (Or only) ─────────────────────────────────────────
+# Role enforcement is on the frontend route guard, matching the existing
+# /api/admin/* endpoints. The service-role key used here must never reach
+# non-Or users.
+
+# Must stay in sync with the profiles.role CHECK constraint.
+ALLOWED_ROLES = {"or", "denise", "publisher"}
+
+
+class CreateUserRequest(BaseModel):
+    email:    str
+    password: str
+    role:     str
+
+
+class UpdateUserRoleRequest(BaseModel):
+    user_id: str
+    role:    str
+
+
+class DeleteUserRequest(BaseModel):
+    user_id: str
+
+
+def _count_users_with_role(sb, role: str) -> int:
+    resp = sb.from_("profiles").select("id").eq("role", role).execute()
+    return len(resp.data or [])
+
+
+@app.post("/api/admin/create-user")
+async def create_user(req: CreateUserRequest):
+    """Create a Supabase Auth user and its matching profiles row."""
+    email = (req.email or "").strip().lower()
+    role  = (req.role  or "").strip()
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=422, detail="A valid email is required.")
+    if len(req.password or "") < 6:
+        raise HTTPException(status_code=422, detail="Password must be at least 6 characters.")
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=422, detail=f"Role must be one of: {', '.join(sorted(ALLOWED_ROLES))}.")
+
+    sb = _sb()
+    try:
+        created = await run_in_threadpool(
+            sb.auth.admin.create_user,
+            {"email": email, "password": req.password, "email_confirm": True},
+        )
+    except Exception as e:
+        # Most commonly a duplicate address.
+        raise HTTPException(status_code=400, detail=f"Could not create user: {e}")
+
+    if created.user is None:
+        raise HTTPException(status_code=500, detail="Auth user was not created.")
+    user_id = created.user.id
+
+    try:
+        # upsert, not insert: tolerates a DB trigger having already made the row.
+        await run_in_threadpool(
+            lambda: sb.from_("profiles")
+                      .upsert({"id": user_id, "email": email, "role": role})
+                      .execute()
+        )
+    except Exception as e:
+        # Roll back the auth user so a failed profile write cannot leave an
+        # orphaned login that the Users page would never show.
+        try:
+            await run_in_threadpool(sb.auth.admin.delete_user, user_id)
+        except Exception as cleanup_err:
+            print(f"[create-user] rollback failed for {user_id}: {cleanup_err}")
+        raise HTTPException(status_code=500, detail=f"Could not create profile: {e}")
+
+    print(f"[create-user] created {email!r} with role {role!r} ({user_id})")
+    return {"ok": True, "user": {"id": user_id, "email": email, "role": role}}
+
+
+@app.post("/api/admin/update-user-role")
+async def update_user_role(req: UpdateUserRoleRequest):
+    """Change a user's role in the profiles table."""
+    role = (req.role or "").strip()
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=422, detail=f"Role must be one of: {', '.join(sorted(ALLOWED_ROLES))}.")
+
+    sb = _sb()
+    try:
+        current = await run_in_threadpool(
+            lambda: sb.from_("profiles").select("role").eq("id", req.user_id).execute()
+        )
+        rows = current.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="User profile not found.")
+
+        # Refuse to demote the last 'or' — nobody could reach this page again.
+        if rows[0].get("role") == "or" and role != "or":
+            if await run_in_threadpool(_count_users_with_role, sb, "or") <= 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot change the role of the only remaining Or user.",
+                )
+
+        updated = await run_in_threadpool(
+            lambda: sb.from_("profiles")
+                      .update({"role": role})
+                      .eq("id", req.user_id)
+                      .execute()
+        )
+        if not (updated.data or []):
+            raise HTTPException(status_code=404, detail="User profile not found.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    print(f"[update-user-role] {req.user_id} → {role!r}")
+    return {"ok": True}
+
+
+@app.post("/api/admin/delete-user")
+async def delete_user(req: DeleteUserRequest):
+    """Delete a user from Supabase Auth and the profiles table."""
+    sb = _sb()
+    try:
+        current = await run_in_threadpool(
+            lambda: sb.from_("profiles").select("role").eq("id", req.user_id).execute()
+        )
+        rows = current.data or []
+
+        # Refuse to delete the last 'or' — that would lock everyone out of admin.
+        if rows and rows[0].get("role") == "or":
+            if await run_in_threadpool(_count_users_with_role, sb, "or") <= 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot delete the only remaining Or user.",
+                )
+
+        # profiles.id is ON DELETE CASCADE from auth.users, so removing the auth
+        # user clears the profile too; the explicit delete below covers a profile
+        # row that has no matching auth user.
+        await run_in_threadpool(sb.auth.admin.delete_user, req.user_id)
+        try:
+            await run_in_threadpool(
+                lambda: sb.from_("profiles").delete().eq("id", req.user_id).execute()
+            )
+        except Exception as e:
+            print(f"[delete-user] profile row cleanup skipped for {req.user_id}: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    print(f"[delete-user] deleted {req.user_id}")
+    return {"ok": True}

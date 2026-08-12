@@ -14,6 +14,26 @@ const ROLE_LABEL = {
   denise:    'Denise',
 }
 
+// Must stay in sync with the profiles.role CHECK constraint.
+const ROLE_OPTIONS = [
+  { value: 'or',        label: 'Or' },
+  { value: 'denise',    label: 'Denise' },
+  { value: 'publisher', label: 'Publisher' },
+]
+
+const ROLE_ORDER = ['or', 'publisher', 'denise']
+
+function sortUsers(list) {
+  return [...list].sort((a, b) => {
+    // Unknown roles sort last rather than first (indexOf returns -1).
+    const ra = ROLE_ORDER.indexOf(a.role), rb = ROLE_ORDER.indexOf(b.role)
+    const oa = ra === -1 ? ROLE_ORDER.length : ra
+    const ob = rb === -1 ? ROLE_ORDER.length : rb
+    if (oa !== ob) return oa - ob
+    return (a.email || '').localeCompare(b.email || '')
+  })
+}
+
 export default function UsersPage() {
   const { role } = useAuth()
   const navigate = useNavigate()
@@ -33,28 +53,39 @@ export default function UsersPage() {
   const [retainerError,   setRetainerError]   = useState('')
   const [retainerSaved,   setRetainerSaved]   = useState(false)
 
+  // ── Add user form ──
+  const [newEmail,    setNewEmail]    = useState('')
+  const [newPass,     setNewPass]     = useState('')
+  const [newRole,     setNewRole]     = useState('denise')
+  const [adding,      setAdding]      = useState(false)
+  const [addError,    setAddError]    = useState('')
+  const [addedEmail,  setAddedEmail]  = useState('')
+
+  // ── Per-user role change / delete ──
+  const [rowBusyId,   setRowBusyId]   = useState(null)  // user id mid-request
+  const [rowError,    setRowError]    = useState('')
+  const [confirmId,   setConfirmId]   = useState(null)  // user pending delete confirm
+
   // Guard — only Or may access this page
   useEffect(() => {
     if (role && role !== 'or') navigate('/', { replace: true })
   }, [role, navigate])
 
+  async function loadUsers() {
+    try {
+      const res  = await fetch(`${API_BASE}/api/admin/users`)
+      const data = await res.json()
+      if (!data.users) throw new Error()
+      setUsers(sortUsers(data.users))
+      setLoadError('')
+    } catch {
+      setLoadError('Failed to load users.')
+    }
+  }
+
   useEffect(() => {
     if (role !== 'or') return
-    fetch(`${API_BASE}/api/admin/users`)
-      .then(r => r.json())
-      .then(d => {
-        if (d.users) {
-          // Sort by a stable order: or → publisher → denise → others
-          const order = ['or', 'publisher', 'denise']
-          const sorted = [...d.users].sort(
-            (a, b) => order.indexOf(a.role) - order.indexOf(b.role)
-          )
-          setUsers(sorted)
-        } else {
-          setLoadError('Failed to load users.')
-        }
-      })
-      .catch(() => setLoadError('Failed to load users.'))
+    loadUsers()
   }, [role])
 
   // Load the current retainer email from the settings table
@@ -119,6 +150,84 @@ export default function UsersPage() {
     }
   }
 
+  // Auto-dismiss the "user added" confirmation
+  useEffect(() => {
+    if (!addedEmail) return
+    const t = setTimeout(() => setAddedEmail(''), 3000)
+    return () => clearTimeout(t)
+  }, [addedEmail])
+
+  async function postAdmin(path, body) {
+    const res  = await fetch(`${API_BASE}${path}`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.detail || 'Request failed.')
+    return data
+  }
+
+  async function handleAddUser(e) {
+    e.preventDefault()
+    const email = newEmail.trim().toLowerCase()
+    setAddError('')
+    setAddedEmail('')
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setAddError('Enter a valid email address.'); return
+    }
+    if (newPass.length < 6) {
+      setAddError('Password must be at least 6 characters.'); return
+    }
+
+    setAdding(true)
+    try {
+      await postAdmin('/api/admin/create-user', {
+        email, password: newPass, role: newRole,
+      })
+      setNewEmail(''); setNewPass(''); setNewRole('denise')
+      setAddedEmail(email)
+      await loadUsers()
+    } catch (err) {
+      setAddError(err.message)
+    } finally {
+      setAdding(false)
+    }
+  }
+
+  async function handleRoleChange(user, nextRole) {
+    if (nextRole === user.role) return
+    setRowError('')
+    setRowBusyId(user.id)
+    try {
+      await postAdmin('/api/admin/update-user-role', {
+        user_id: user.id, role: nextRole,
+      })
+      await loadUsers()
+    } catch (err) {
+      setRowError(err.message)
+      await loadUsers()   // resync the dropdown with the server's actual state
+    } finally {
+      setRowBusyId(null)
+    }
+  }
+
+  async function handleDelete(user) {
+    setRowError('')
+    setRowBusyId(user.id)
+    try {
+      await postAdmin('/api/admin/delete-user', { user_id: user.id })
+      setConfirmId(null)
+      await loadUsers()
+    } catch (err) {
+      setRowError(err.message)
+      setConfirmId(null)
+    } finally {
+      setRowBusyId(null)
+    }
+  }
+
   function openForm(userId) {
     setActiveId(userId)
     setNewPassword('')
@@ -167,6 +276,45 @@ export default function UsersPage() {
         </p>
       )}
 
+      <section className="add-user-section">
+        <h2 className="settings-heading">Add User</h2>
+        {addedEmail && <p className="users-success">✓ Added {addedEmail}</p>}
+        <form className="add-user-form" onSubmit={handleAddUser}>
+          <input
+            type="email"
+            className="pw-input"
+            placeholder="Email"
+            value={newEmail}
+            onChange={e => { setNewEmail(e.target.value); setAddError('') }}
+            disabled={adding}
+          />
+          <input
+            type="password"
+            className="pw-input"
+            placeholder="Password (min 6 characters)"
+            value={newPass}
+            onChange={e => { setNewPass(e.target.value); setAddError('') }}
+            disabled={adding}
+          />
+          <select
+            className="pw-input role-select"
+            value={newRole}
+            onChange={e => setNewRole(e.target.value)}
+            disabled={adding}
+          >
+            {ROLE_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+          <button type="submit" className="btn-primary pw-save" disabled={adding}>
+            {adding ? 'Adding…' : 'Add User'}
+          </button>
+        </form>
+        {addError && <p className="pw-error">{addError}</p>}
+      </section>
+
+      {rowError && <p className="form-error">{rowError}</p>}
+
       <div className="users-list">
         {users.map(user => (
           <div key={user.id} className="user-row">
@@ -208,13 +356,59 @@ export default function UsersPage() {
                   </button>
                 </div>
               </form>
+            ) : confirmId === user.id ? (
+              <div className="confirm-delete">
+                <span className="confirm-text">
+                  Are you sure you want to delete this user?
+                </span>
+                <div className="pw-actions">
+                  <button
+                    className="btn-danger"
+                    onClick={() => handleDelete(user)}
+                    disabled={rowBusyId === user.id}
+                  >
+                    {rowBusyId === user.id ? 'Deleting…' : 'Confirm'}
+                  </button>
+                  <button
+                    className="btn-cancel"
+                    onClick={() => setConfirmId(null)}
+                    disabled={rowBusyId === user.id}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
             ) : (
-              <button
-                className="btn-change-pw"
-                onClick={() => openForm(user.id)}
-              >
-                Change Password
-              </button>
+              <div className="user-actions">
+                <select
+                  className="pw-input role-select"
+                  value={ROLE_OPTIONS.some(o => o.value === user.role) ? user.role : ''}
+                  onChange={e => handleRoleChange(user, e.target.value)}
+                  disabled={rowBusyId === user.id}
+                >
+                  {/* Placeholder only shows if the stored role is unrecognised */}
+                  {!ROLE_OPTIONS.some(o => o.value === user.role) && (
+                    <option value="" disabled>No role</option>
+                  )}
+                  {ROLE_OPTIONS.map(o => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+                <button
+                  className="btn-change-pw"
+                  onClick={() => openForm(user.id)}
+                  disabled={rowBusyId === user.id}
+                >
+                  Change Password
+                </button>
+                <button
+                  className="btn-delete"
+                  onClick={() => { setRowError(''); setConfirmId(user.id) }}
+                  disabled={rowBusyId === user.id}
+                >
+                  Delete
+                </button>
+              </div>
             )}
           </div>
         ))}
