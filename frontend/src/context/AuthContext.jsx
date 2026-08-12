@@ -86,7 +86,7 @@ export function AuthProvider({ children }) {
   // without triggering any state updates or consumer re-renders.
   const authedUserIdRef = useRef(null)
 
-  const fetchRole = async (userId) => {
+  const fetchRoleOnce = async (userId) => {
     try {
       const result = await Promise.race([
         supabase.from('profiles').select('role').eq('id', userId).single(),
@@ -95,11 +95,27 @@ export function AuthProvider({ children }) {
         ),
       ])
       const { data, error } = result
-      if (error) return null
-      return data?.role ?? null
-    } catch {
-      return null
+      if (error) return { role: null, error }
+      return { role: data?.role ?? null, error: null }
+    } catch (err) {
+      return { role: null, error: err }
     }
+  }
+
+  // A null role bounces the user to /login, so one transient failure must not
+  // decide it. Retry once — this also covers the window just after a user
+  // switch, where the first query can still carry the previous access token
+  // and return no rows under RLS.
+  const fetchRole = async (userId) => {
+    const first = await fetchRoleOnce(userId)
+    if (first.role) return first.role
+    if (first.error) console.warn('[auth] role lookup failed, retrying:', first.error)
+    await new Promise(r => setTimeout(r, 600))
+    const second = await fetchRoleOnce(userId)
+    if (!second.role) {
+      console.error('[auth] role lookup failed after retry:', second.error)
+    }
+    return second.role
   }
 
   useEffect(() => {

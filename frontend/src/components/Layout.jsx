@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { useAuth, useAuthProfile } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 
@@ -13,49 +13,96 @@ const ROLE_BUTTONS = {
   publisher: { role: 'publisher', initial: 'E', label: 'Switch to Publisher', color: '#0369a1' },
 }
 
-// Which roles each role can switch into — mirrors SWITCH_GRAPH on the backend.
-const SWITCH_TARGETS_BY_ROLE = {
-  or:        [ROLE_BUTTONS.denise, ROLE_BUTTONS.publisher],
-  denise:    [ROLE_BUTTONS.or],
-  publisher: [ROLE_BUTTONS.or],
-}
+// Any user may switch into any role — the backend enforces only that the
+// caller presents a valid access token.
+const ALL_TARGETS = [ROLE_BUTTONS.or, ROLE_BUTTONS.denise, ROLE_BUTTONS.publisher]
 
 function UserSwitcher({ role }) {
   const [switchingTo, setSwitchingTo] = useState(null)
   const [switchError,  setSwitchError]  = useState('')
-  const navigate = useNavigate()
 
-  const targets = SWITCH_TARGETS_BY_ROLE[role] ?? []
-  if (targets.length === 0) return null
+  if (!role) return null
+  const targets = ALL_TARGETS
 
   const handleSwitch = async (target) => {
     if (switchingTo) return
     setSwitchingTo(target.role)
     setSwitchError('')
+
+    // Keep the current session so we can put the user back exactly as they were
+    // if any step fails. Without this a failed setSession leaves them signed out.
+    let previousSession = null
+
     try {
-      // Send our own access token so the backend can verify who is asking.
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session?.access_token) throw new Error('Your session expired — sign in again.')
+      console.log(`[switch-user] → ${target.role}`)
+
+      const { data: sessionData, error: sessionErr } = await supabase.auth.getSession()
+      if (sessionErr) {
+        console.error('[switch-user] getSession failed:', sessionErr)
+        throw new Error('Could not read your current session. Try signing in again.')
+      }
+      previousSession = sessionData?.session ?? null
+      if (!previousSession?.access_token) {
+        throw new Error('Your session has expired — please sign in again.')
+      }
 
       const res = await fetch(`${API_BASE}/api/admin/switch-user`, {
         method: 'POST',
         headers: {
           'Content-Type':  'application/json',
-          'Authorization': `Bearer ${session.access_token}`,
+          'Authorization': `Bearer ${previousSession.access_token}`,
         },
         body: JSON.stringify({ target_role: target.role }),
       })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.detail || 'Could not switch user.')
 
-      const { error } = await supabase.auth.setSession({
+      const data = await res.json().catch(() => ({}))
+      console.log(`[switch-user] backend responded ${res.status}`, data?.email ?? '')
+
+      if (!res.ok) {
+        throw new Error(data.detail || `Switch failed (HTTP ${res.status}).`)
+      }
+      if (!data.access_token || !data.refresh_token) {
+        console.error('[switch-user] response missing tokens:', data)
+        throw new Error('The server did not return a usable session.')
+      }
+
+      const { error: setErr } = await supabase.auth.setSession({
         access_token:  data.access_token,
         refresh_token: data.refresh_token,
       })
-      if (error) throw error
-      navigate('/clients')
+      if (setErr) {
+        console.error('[switch-user] setSession failed:', setErr)
+        throw new Error(setErr.message || 'Could not apply the new session.')
+      }
+
+      console.log(`[switch-user] now signed in as ${data.email}`)
+
+      // Full reload rather than client-side navigation. Reading the new user's
+      // profile immediately races the client's token swap — the query can still
+      // carry the old token, return no rows under RLS, and null out the role,
+      // which reads as being signed out. Reloading bootstraps auth cleanly and
+      // also drops any data cached for the previous user.
+      window.location.replace('/clients')
     } catch (err) {
       console.error('[switch-user] FAILED:', err)
+
+      // Restore the previous session if it was disturbed, so a failed switch
+      // never logs the user out of the account they were already using.
+      if (previousSession?.access_token && previousSession?.refresh_token) {
+        try {
+          const { data: current } = await supabase.auth.getSession()
+          if (current?.session?.access_token !== previousSession.access_token) {
+            console.warn('[switch-user] restoring previous session')
+            await supabase.auth.setSession({
+              access_token:  previousSession.access_token,
+              refresh_token: previousSession.refresh_token,
+            })
+          }
+        } catch (restoreErr) {
+          console.error('[switch-user] could not restore previous session:', restoreErr)
+        }
+      }
+
       setSwitchError(err.message || 'Switch failed')
       setSwitchingTo(null)
     }

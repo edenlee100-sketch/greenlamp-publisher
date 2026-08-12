@@ -588,12 +588,9 @@ async def notify(req: NotifyRequest, background_tasks: BackgroundTasks):
 # Human-readable role names, used in switcher error messages.
 ROLE_DISPLAY = {"or": "Or", "denise": "Denise", "publisher": "Publisher"}
 
-# Which roles each role may switch into. Mirrors the top-bar UI.
-SWITCH_GRAPH: dict[str, set[str]] = {
-    "or":        {"denise", "publisher"},
-    "denise":    {"or"},
-    "publisher": {"or"},
-}
+# Any authenticated user may switch into any role. The caller must still prove
+# who they are with a valid access token — see _caller_role below.
+SWITCHABLE_ROLES: set[str] = {"or", "denise", "publisher"}
 
 
 def _first_user_for_role(sb, role: str) -> dict | None:
@@ -654,8 +651,8 @@ async def switch_user(req: SwitchUserRequest, authorization: str | None = Header
       2. auth.verify_otp(token_hash)    → real session   (server-side redemption)
     Returns access_token + refresh_token; frontend calls setSession() directly.
 
-    The caller must present their own Supabase access token, and may only
-    switch into roles allowed by SWITCH_GRAPH for their own role.
+    The caller must present their own Supabase access token. Any authenticated
+    user may switch into any role.
     """
     sb = _sb()
 
@@ -675,13 +672,8 @@ async def switch_user(req: SwitchUserRequest, authorization: str | None = Header
             raise HTTPException(status_code=404, detail="That user no longer exists.")
         target_role = (rows[0].get("role") or "").strip()
 
-    if target_role not in SWITCH_GRAPH:
+    if target_role not in SWITCHABLE_ROLES:
         raise HTTPException(status_code=422, detail=f"Unknown target role {target_role!r}.")
-
-    allowed = SWITCH_GRAPH.get(caller_role, set())
-    if target_role not in allowed:
-        print(f"[switch-user] REJECTED — {caller_role!r} may not switch to {target_role!r}")
-        raise HTTPException(status_code=403, detail="You cannot switch to that role.")
 
     target = await run_in_threadpool(_first_user_for_role, sb, target_role)
     if not target or not target.get("email"):
