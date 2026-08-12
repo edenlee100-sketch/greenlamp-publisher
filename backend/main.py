@@ -709,6 +709,9 @@ async def switch_user(req: SwitchUserRequest, authorization: str | None = Header
             "refresh_token": session.refresh_token,
             "email":         target_email,
             "role":          target_role,
+            # Lets the frontend seed the role directly and skip its own
+            # RLS-guarded profiles lookup on the switch path.
+            "user_id":       target.get("id"),
         }
     except HTTPException:
         raise

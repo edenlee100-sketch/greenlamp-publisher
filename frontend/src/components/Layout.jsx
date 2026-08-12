@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useAuth, useAuthProfile } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 
@@ -13,16 +13,20 @@ const ROLE_BUTTONS = {
   publisher: { role: 'publisher', initial: 'E', label: 'Switch to Publisher', color: '#0369a1' },
 }
 
-// Any user may switch into any role — the backend enforces only that the
-// caller presents a valid access token.
-const ALL_TARGETS = [ROLE_BUTTONS.or, ROLE_BUTTONS.denise, ROLE_BUTTONS.publisher]
+// Which roles each role can switch into. Your own role is never offered.
+const SWITCH_TARGETS_BY_ROLE = {
+  or:        [ROLE_BUTTONS.denise, ROLE_BUTTONS.publisher],
+  denise:    [ROLE_BUTTONS.or],
+  publisher: [ROLE_BUTTONS.or],
+}
 
-function UserSwitcher({ role }) {
+function UserSwitcher({ role, primeRole }) {
   const [switchingTo, setSwitchingTo] = useState(null)
   const [switchError,  setSwitchError]  = useState('')
+  const navigate = useNavigate()
 
-  if (!role) return null
-  const targets = ALL_TARGETS
+  const targets = SWITCH_TARGETS_BY_ROLE[role] ?? []
+  if (targets.length === 0) return null
 
   const handleSwitch = async (target) => {
     if (switchingTo) return
@@ -32,6 +36,7 @@ function UserSwitcher({ role }) {
     // Keep the current session so we can put the user back exactly as they were
     // if any step fails. Without this a failed setSession leaves them signed out.
     let previousSession = null
+    const tStart = performance.now()
 
     try {
       console.log(`[switch-user] → ${target.role}`)
@@ -56,7 +61,10 @@ function UserSwitcher({ role }) {
       })
 
       const data = await res.json().catch(() => ({}))
-      console.log(`[switch-user] backend responded ${res.status}`, data?.email ?? '')
+      console.log(
+        `[switch-user] backend responded ${res.status} in ` +
+        `${Math.round(performance.now() - tStart)}ms`, data?.email ?? ''
+      )
 
       if (!res.ok) {
         throw new Error(data.detail || `Switch failed (HTTP ${res.status}).`)
@@ -66,23 +74,30 @@ function UserSwitcher({ role }) {
         throw new Error('The server did not return a usable session.')
       }
 
+      // Seed the role before applying the session so AuthContext does not need
+      // its own profiles lookup — that query contends with the auth lock during
+      // setSession and is the slow, timeout-prone step.
+      if (data.user_id && data.role) primeRole(data.user_id, data.role)
+
+      const tSet = performance.now()
       const { error: setErr } = await supabase.auth.setSession({
         access_token:  data.access_token,
         refresh_token: data.refresh_token,
       })
+      console.log(`[switch-user] setSession took ${Math.round(performance.now() - tSet)}ms`)
       if (setErr) {
         console.error('[switch-user] setSession failed:', setErr)
         throw new Error(setErr.message || 'Could not apply the new session.')
       }
 
-      console.log(`[switch-user] now signed in as ${data.email}`)
+      console.log(
+        `[switch-user] now signed in as ${data.email} (${data.role}) — ` +
+        `total ${Math.round(performance.now() - tStart)}ms`
+      )
 
-      // Full reload rather than client-side navigation. Reading the new user's
-      // profile immediately races the client's token swap — the query can still
-      // carry the old token, return no rows under RLS, and null out the role,
-      // which reads as being signed out. Reloading bootstraps auth cleanly and
-      // also drops any data cached for the previous user.
-      window.location.replace('/clients')
+      // Client-side navigation — no reload needed. AuthContext picks up the new
+      // session from onAuthStateChange and resolves the role off the auth lock.
+      navigate('/clients', { replace: true })
     } catch (err) {
       console.error('[switch-user] FAILED:', err)
 
@@ -142,7 +157,7 @@ export default function Layout({ title, children }) {
   // useAuthProfile re-renders only when user email/avatar changes (login/logout).
   // Page content (children) is unaffected by these topbar-only updates.
   const { user }          = useAuthProfile()
-  const { signOut, role } = useAuth()
+  const { signOut, role, primeRole } = useAuth()
 
   return (
     <div className="app-shell">
@@ -151,7 +166,7 @@ export default function Layout({ title, children }) {
           <span className="logo-dot" /> Greenlamp Publisher
         </span>
         <div className="topbar-right">
-          <UserSwitcher key={role} role={role} />
+          <UserSwitcher key={role} role={role} primeRole={primeRole} />
           {role === 'or' && (
             <Link to="/users" className="topbar-nav-link">Users</Link>
           )}
