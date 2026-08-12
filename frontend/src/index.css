@@ -143,63 +143,6 @@ body {
 }
 .topbar-nav-link:hover { border-color: var(--text-muted); color: var(--text); }
 
-/* ── User switcher (Or → Denise / Eden) ── */
-.user-switcher {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.user-switch-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: none;
-  background: var(--switch-color, #6b7280);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: opacity .15s, transform .1s;
-  flex-shrink: 0;
-}
-.user-switch-btn:hover:not(:disabled) { opacity: .85; transform: scale(1.1); }
-.user-switch-btn:disabled { opacity: .5; cursor: not-allowed; }
-.user-switch-error {
-  font-size: 12px;
-  font-weight: 700;
-  color: #dc2626;
-  cursor: default;
-}
-
-/* Readable inline reason, replacing the old bare "!" indicator. */
-.user-switch-message {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 320px;
-  font-size: 12px;
-  line-height: 1.35;
-  color: #991b1b;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  padding: 5px 8px;
-}
-
-.user-switch-dismiss {
-  border: none;
-  background: transparent;
-  color: #991b1b;
-  font-size: 15px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 2px;
-}
-.user-switch-dismiss:hover { color: #7f1d1d; }
-
 /* ── App shell (authenticated views) ── */
 .app-shell {
   min-height: 100vh;
