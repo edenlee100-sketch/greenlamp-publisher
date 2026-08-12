@@ -19,7 +19,13 @@ from scraper.prices import fetch_prices                      # noqa: E402
 from scraper.status_checker import run_status_check          # noqa: E402
 from scraper.gmail_checker import check_gmail_notifications  # noqa: E402
 from scraper.reminder_checker import check_stale_articles    # noqa: E402
-from scraper.email_notifications import send_email_to_roles, send_retainer_email, _ROLE_EMAILS  # noqa: E402
+from scraper.email_notifications import (  # noqa: E402
+    send_email_to_roles,
+    send_retainer_email,
+    role_emails,
+    retainer_email,
+    sender_email,
+)
 from scraper.bulk_price_check import check_prices_bulk                                            # noqa: E402
 from scraper.sheets_export import create_price_check_sheet                                        # noqa: E402
 from scraper import presswhizz, linksme                                                            # noqa: E402
@@ -62,7 +68,14 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     print(f"[scheduler] started — status check + Gmail check every {CHECK_INTERVAL_MINUTES} minutes, reminder check every hour")
     print(f"[startup] CORS_ORIGINS={_CORS_ORIGINS}")
-    print(f"[startup] publisher email = {_ROLE_EMAILS.get('publisher', 'NOT FOUND')}")
+    # Print the values the email module actually resolves, so the log can never
+    # drift from the addresses real emails are sent to.
+    _roles = role_emails()
+    print(f"[startup] OR_EMAIL        = {_roles['or']}        {'(env)' if os.environ.get('OR_EMAIL')        else '(default)'}")
+    print(f"[startup] PUBLISHER_EMAIL = {_roles['publisher']} {'(env)' if os.environ.get('PUBLISHER_EMAIL') else '(default)'}")
+    print(f"[startup] DENISE_EMAIL    = {_roles['denise']}    {'(env)' if os.environ.get('DENISE_EMAIL')    else '(default)'}")
+    print(f"[startup] RETAINER_EMAIL  = {retainer_email()}    {'(env)' if os.environ.get('RETAINER_EMAIL')  else '(default)'}")
+    print(f"[startup] email sender    = {sender_email()}")
     yield
     scheduler.shutdown(wait=False)
     print("[scheduler] stopped")
@@ -384,7 +397,7 @@ async def email_test():
     token_set = bool(os.environ.get("GOOGLE_TOKEN_JSON"))
     report: dict = {
         "google_token_set": token_set,
-        "sender": "seojobisrael@gmail.com",
+        "sender": sender_email(),
     }
 
     if not token_set:
@@ -571,8 +584,10 @@ async def notify(req: NotifyRequest, background_tasks: BackgroundTasks):
 
 # ── User switcher (Or only) ───────────────────────────────────────────────────
 
-# Hard-coded allow-list — accounts that can be switched into via admin session
-_SWITCH_TARGETS = {"denise@greenlamp.co", "office@greenlamp.co", "seojobisrael@gmail.com"}
+# Allow-list — accounts that can be switched into via admin session
+def _switch_targets() -> set[str]:
+    roles = role_emails()
+    return {roles["or"], roles["denise"], retainer_email()}
 
 class SwitchUserRequest(BaseModel):
     target_email: str
@@ -588,7 +603,7 @@ async def switch_user(req: SwitchUserRequest):
     Only allows switching to the hard-coded allow-list above.
     """
     print(f"[switch-user] received request for target_email={req.target_email!r}")
-    if req.target_email not in _SWITCH_TARGETS:
+    if req.target_email not in _switch_targets():
         print(f"[switch-user] REJECTED — not in allow-list")
         raise HTTPException(status_code=403, detail="Not an allowed switch target.")
     try:

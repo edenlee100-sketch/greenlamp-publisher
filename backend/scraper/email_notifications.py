@@ -4,7 +4,11 @@ Email notifications via Gmail API (OAuth2).
 Environment variable required:
   GOOGLE_TOKEN_JSON – contents of the OAuth2 token.json file for seojobisrael@gmail.com
 
-Sender: seojobisrael@gmail.com
+Email addresses are configured via environment variables:
+  OR_EMAIL        (default: seojobisrael@gmail.com)
+  PUBLISHER_EMAIL (default: edenlee@greenlamp.co)
+  DENISE_EMAIL    (default: denise@greenlamp.co)
+  RETAINER_EMAIL  (default: office@greenlamp.co)
 """
 import os
 import base64
@@ -15,13 +19,32 @@ from email.mime.text import MIMEText
 
 APP_URL = "https://greenlamp-publisher-psi.vercel.app"
 
-_ROLE_EMAILS: dict[str, str] = {
-    "or":        "seojobisrael@gmail.com",
-    "publisher": "edenlee@greenlamp.co",
-    "denise":    "denise@greenlamp.co",
-}
+DEFAULT_OR_EMAIL        = "seojobisrael@gmail.com"
+DEFAULT_PUBLISHER_EMAIL = "edenlee@greenlamp.co"
+DEFAULT_DENISE_EMAIL    = "denise@greenlamp.co"
+DEFAULT_RETAINER_EMAIL  = "office@greenlamp.co"
 
-SENDER = "seojobisrael@gmail.com"
+
+def _env(name: str, default: str) -> str:
+    """Read an email from the environment, ignoring unset/blank values."""
+    return (os.environ.get(name) or "").strip() or default
+
+
+def role_emails() -> dict[str, str]:
+    """Resolved role → address map. Read at call time so env changes take effect."""
+    return {
+        "or":        _env("OR_EMAIL",        DEFAULT_OR_EMAIL),
+        "publisher": _env("PUBLISHER_EMAIL", DEFAULT_PUBLISHER_EMAIL),
+        "denise":    _env("DENISE_EMAIL",    DEFAULT_DENISE_EMAIL),
+    }
+
+
+def retainer_email() -> str:
+    return _env("RETAINER_EMAIL", DEFAULT_RETAINER_EMAIL)
+
+
+def sender_email() -> str:
+    return _env("OR_EMAIL", DEFAULT_OR_EMAIL)
 
 
 def _gmail_service():
@@ -53,7 +76,8 @@ def send_email_to_roles(
         print("[email] GOOGLE_TOKEN_JSON not set — skipping")
         return
 
-    to_emails = [_ROLE_EMAILS[r] for r in roles if r in _ROLE_EMAILS]
+    resolved = role_emails()
+    to_emails = [resolved[r] for r in roles if r in resolved]
     if not to_emails:
         print(f"[email] no addresses mapped for roles {roles!r} — skipping")
         return
@@ -97,7 +121,7 @@ def send_email_to_roles(
         service = _gmail_service()
         for to_addr in to_emails:
             msg = MIMEMultipart("alternative")
-            msg["From"]    = SENDER
+            msg["From"]    = sender_email()
             msg["To"]      = to_addr
             msg["Subject"] = subject
             msg.attach(MIMEText(plain_text, "plain", "utf-8"))
@@ -133,7 +157,7 @@ def send_retainer_email(
     if not mag.endswith("/"):
         mag = mag + "/"
 
-    to_addr = "office@greenlamp.co"
+    to_addr = retainer_email()
     subject = f"Please add to retainer — {client_name} | {mag}"
 
     doc_line_html  = (
@@ -164,7 +188,7 @@ def send_retainer_email(
         service = _gmail_service()
         print("[email/retainer] Gmail service acquired")
         msg = MIMEMultipart("alternative")
-        msg["From"]    = SENDER
+        msg["From"]    = sender_email()
         msg["To"]      = to_addr
         msg["Subject"] = subject
         msg.attach(MIMEText(plain, "plain", "utf-8"))
