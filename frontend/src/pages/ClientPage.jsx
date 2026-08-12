@@ -225,6 +225,13 @@ export default function ClientPage() {
   const navigate        = useNavigate()
   const [searchParams]  = useSearchParams()
 
+  // Or can carry out Denise's and the Publisher's actions from his own account,
+  // so he never has to switch users. This only widens which existing controls Or
+  // reaches — every action still runs the same handler, and therefore fires the
+  // same notification event, as when the responsible role performs it.
+  const isOr = role === 'or'
+  const canSubmitArticles = role === 'denise' || isOr
+
   const [client,   setClient]   = useState(null)
   const [articles, setArticles] = useState([])
   const [loading,  setLoading]  = useState(true)
@@ -788,7 +795,7 @@ export default function ClientPage() {
           ) : null}
         </div>
 
-        {role === 'denise' && (
+        {canSubmitArticles && (
           <button
             className={`btn-submit-article ${showForm ? 'active' : ''}`}
             onClick={() => { setShowForm(v => !v); setSubmitError('') }}
@@ -840,8 +847,8 @@ export default function ClientPage() {
 
       {successMsg && <div className="success-banner">✓ {successMsg}</div>}
 
-      {/* ── Inline submit form (Denise) ── */}
-      {role === 'denise' && showForm && (
+      {/* ── Inline submit form (Denise, and Or acting in her place) ── */}
+      {canSubmitArticles && showForm && (
         <div className="submit-panel">
           <h3 className="submit-panel-title">New Article</h3>
           <form onSubmit={handleSubmit} noValidate>
@@ -1233,6 +1240,33 @@ export default function ClientPage() {
                         {markingId === article.id ? 'Updating…' : 'Mark as sent'}
                       </button>
                     )}
+                    {/* The Publisher's own actions, so Or can cover that stage
+                        without switching accounts. Same gate as the publisher
+                        card, plus a guard so Or never sees two sets of actions
+                        on one card — the block above already covers articles
+                        assigned to him. markSent/returnToOr are the Publisher's
+                        handlers verbatim, so 'sent' and 'returned' fire exactly
+                        as they do when the Publisher clicks them. */}
+                    {article.status === 'approved'
+                      && article.assigned_to !== 'or'
+                      && (!isOther || article.assigned_to === 'publisher') && (
+                      <>
+                        <button
+                          className="btn-send"
+                          onClick={() => markSent(article.id)}
+                          disabled={markingId === article.id || returningId === article.id}
+                        >
+                          {markingId === article.id ? 'Updating…' : 'Mark as sent to publisher'}
+                        </button>
+                        <button
+                          className="btn-return"
+                          onClick={() => returnToOr(article.id)}
+                          disabled={returningId === article.id || markingId === article.id}
+                        >
+                          {returningId === article.id ? 'Returning…' : 'Return to Or'}
+                        </button>
+                      </>
+                    )}
                     {article.status === 'sent_to_publisher' && (
                       <>
                         <button
@@ -1375,8 +1409,16 @@ export default function ClientPage() {
           )
         }
 
+        // Drafts are Denise's stage, so Or gets her card for them — that is
+        // where "Confirm & Notify Or" and the draft edit form live. Reusing her
+        // card rather than duplicating those controls keeps the two views from
+        // drifting apart, and confirmAndNotifyOr still fires 'submitted' exactly
+        // as it does for Denise.
+        const renderOrCardByStage = article =>
+          article.status === 'draft' ? renderDeniseCard(article) : renderOrCard(article)
+
         const renderCard = role === 'denise'    ? renderDeniseCard
-                         : role === 'or'        ? renderOrCard
+                         : role === 'or'        ? renderOrCardByStage
                          : /* publisher */        renderPublisherCard
 
         // ── Publisher split by chosen / preferred publisher ─────────────────
