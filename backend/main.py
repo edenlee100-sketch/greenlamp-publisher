@@ -703,15 +703,20 @@ async def switch_user(req: SwitchUserRequest, authorization: str | None = Header
         if not session:
             raise ValueError(f"verify_otp returned no session (response: {session_resp!r})")
 
-        print(f"[switch-user] success — returning tokens for {target_email!r}")
+        # Return the session exactly as the auth server issued it. The frontend
+        # writes this straight into the auth-js storage key, and its field names
+        # (access_token / refresh_token / expires_at / token_type / user) already
+        # match what auth-js persists, so nothing has to be hand-constructed.
+        session_json = session.model_dump(mode="json")
+
+        print(f"[switch-user] success — returning session for {target_email!r}")
         return {
             "access_token":  session.access_token,
             "refresh_token": session.refresh_token,
             "email":         target_email,
             "role":          target_role,
-            # Lets the frontend seed the role directly and skip its own
-            # RLS-guarded profiles lookup on the switch path.
             "user_id":       target.get("id"),
+            "session":       session_json,
         }
     except HTTPException:
         raise

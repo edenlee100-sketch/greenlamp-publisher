@@ -1,14 +1,12 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { createClient } from '@supabase/supabase-js'
 import { useAuth, useAuthProfile } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 
 const API_BASE = 'https://greenlamp-publisher-production-75fd.up.railway.app'
 
-// DIAGNOSTIC BUILD — remove SWITCH_DEBUG_DELAY_MS once the switch works.
-const SWITCH_DEBUG_DELAY_MS = 5000
-
+// Targets are identified by ROLE, never by email — several users may hold the
+// same role, and the accounts behind a role change over time.
 const ROLE_BUTTONS = {
   or:        { role: 'or',        initial: 'O', label: 'Switch to Or',        color: '#16a34a' },
   denise:    { role: 'denise',    initial: 'D', label: 'Switch to Denise',    color: '#7c3aed' },
@@ -21,38 +19,49 @@ const SWITCH_TARGETS_BY_ROLE = {
   publisher: [ROLE_BUTTONS.or],
 }
 
-const log  = (...a) => console.log('[switch]', ...a)
-const warn = (...a) => console.warn('[switch]', ...a)
-const err  = (...a) => console.error('[switch]', ...a)
-
-// supabase-js derives this as `sb-<first hostname label>-auth-token`.
-function storageKeyForUrl(url) {
-  try {
-    return `sb-${new URL(url).hostname.split('.')[0]}-auth-token`
-  } catch {
-    return null
-  }
+// auth-js derives its storage key as `sb-<first hostname label>-auth-token`
+// (SupabaseClient: `sb-${baseUrl.hostname.split(".")[0]}-auth-token`).
+function authStorageKey() {
+  return `sb-${new URL(import.meta.env.VITE_SUPABASE_URL).hostname.split('.')[0]}-auth-token`
 }
 
-// Read the persisted session back out of localStorage and summarise who it is for.
-function readStoredSession(key) {
-  if (!key) return { key, present: false, note: 'no storage key' }
-  const raw = localStorage.getItem(key)
-  if (!raw) return { key, present: false, note: 'key absent from localStorage' }
-  try {
-    const parsed = JSON.parse(raw)
-    const sess   = parsed?.currentSession ?? parsed
-    return {
-      key,
-      present:   true,
-      userId:    sess?.user?.id    ?? '(none)',
-      userEmail: sess?.user?.email ?? '(none)',
-      tokenTail: (sess?.access_token ?? '').slice(-12),
-      expiresAt: sess?.expires_at ?? '(none)',
-    }
-  } catch (e) {
-    return { key, present: true, note: `unparseable: ${e.message}`, rawLength: raw.length }
+/**
+ * Write the new session straight into auth-js's storage key — no Supabase
+ * client involved.
+ *
+ * This is deliberate. Every previous attempt routed the write through a client
+ * (the shared one, then a second "isolated" one) and both failed for the same
+ * reason: setSession() calls _notifyAllSubscribers, which posts to a
+ * BroadcastChannel *named after the storage key*. Any other client using that
+ * key — including the app's own — receives SIGNED_IN for the new user while its
+ * in-memory session is still the old one. AuthContext then looks up the new
+ * user's profile with the old token, RLS (auth.uid() = id) matches nothing, the
+ * role resolves to null and ProtectedRoute redirects to /login. That is the
+ * "publisher page loads, then bounces to login" behaviour seen in production.
+ *
+ * A plain localStorage write emits no auth event, no broadcast, and takes no
+ * lock, so nothing observes the change until the hard reload — at which point
+ * auth-js reads it through initialize(), the same path a normal page load uses.
+ *
+ * Format verified against auth-js: _saveSession does
+ * `storage.setItem(storageKey, JSON.stringify(session))` with the session flat
+ * (no wrapper), and _isValidSession requires access_token, refresh_token and
+ * expires_at. The backend returns the session exactly as the auth server issued
+ * it, so the shape is authentic rather than reconstructed.
+ */
+function writeSessionToStorage(session) {
+  const key = authStorageKey()
+  if (!session || !session.access_token || !session.refresh_token || !session.expires_at) {
+    throw new Error('The server did not return a usable session.')
   }
+  localStorage.setItem(key, JSON.stringify(session))
+
+  // Read back so a quota error or a storage-policy block cannot pass silently.
+  const stored = JSON.parse(localStorage.getItem(key) || 'null')
+  if (stored?.access_token !== session.access_token) {
+    throw new Error('The new session could not be saved to this browser.')
+  }
+  return { key, userId: stored?.user?.id, email: stored?.user?.email }
 }
 
 function UserSwitcher({ role }) {
@@ -67,156 +76,37 @@ function UserSwitcher({ role }) {
     setSwitchingTo(target.role)
     setSwitchError('')
 
-    const t0 = performance.now()
-    const ms = () => `${Math.round(performance.now() - t0)}ms`
-    const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
-    const storageKey   = storageKeyForUrl(SUPABASE_URL)
-
-    // ── PROBE ─────────────────────────────────────────────────────────────
-    // Purely observational, synchronous, and torn down before we navigate.
-    // supabase-js names its BroadcastChannel after the storageKey, so a second
-    // client sharing that key is NOT isolated: its SIGNED_IN is rebroadcast to
-    // this client, whose in-memory session is still the OLD user. If that is
-    // what breaks the switch, this probe fires with the NEW user id while the
-    // shared client still holds the old token.
-    let probe = null
     try {
-      probe = supabase.auth.onAuthStateChange((event, session) => {
-        warn(`[${ms()}] PROBE: shared client saw auth event "${event}"`,
-             '| session user:', session?.user?.id ?? '(none)',
-             '| email:', session?.user?.email ?? '(none)')
-      })
-      log('probe attached to the shared client')
-    } catch (e) {
-      warn('could not attach probe:', e)
-    }
+      console.log('[switch] target role:', target.role)
 
-    const detachProbe = () => {
-      try { probe?.data?.subscription?.unsubscribe() } catch { /* ignore */ }
-    }
+      // Read-only on the shared client: getSession() notifies nobody.
+      const { data, error: sessErr } = await supabase.auth.getSession()
+      if (sessErr) throw new Error('Could not read your current session.')
+      const token = data?.session?.access_token
+      if (!token) throw new Error('Your session has expired — please sign in again.')
 
-    try {
-      log('════════ SWITCH START ════════')
-      log(`[${ms()}] target role:`, target.role)
-      log(`[${ms()}] supabase url:`, SUPABASE_URL)
-      log(`[${ms()}] derived storage key:`, storageKey)
-      log(`[${ms()}] stored session BEFORE:`, readStoredSession(storageKey))
-
-      // ── 1. Current session (read-only on the shared client) ──────────────
-      log(`[${ms()}] reading current session from shared client…`)
-      const { data: sessData, error: sessErr } = await supabase.auth.getSession()
-      if (sessErr) {
-        err(`[${ms()}] getSession error:`, sessErr)
-        throw new Error('Could not read your current session.')
-      }
-      const cur = sessData?.session
-      log(`[${ms()}] current session:`, {
-        userId:    cur?.user?.id    ?? '(none)',
-        userEmail: cur?.user?.email ?? '(none)',
-        tokenTail: (cur?.access_token ?? '').slice(-12),
-      })
-      if (!cur?.access_token) throw new Error('Your session has expired — please sign in again.')
-
-      // ── 2. Backend call ──────────────────────────────────────────────────
-      log(`[${ms()}] POST /api/admin/switch-user  target_role=${target.role}`)
       const res = await fetch(`${API_BASE}/api/admin/switch-user`, {
         method: 'POST',
         headers: {
           'Content-Type':  'application/json',
-          'Authorization': `Bearer ${cur.access_token}`,
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({ target_role: target.role }),
       })
-      const body = await res.json().catch(e => ({ _parseError: String(e) }))
-      log(`[${ms()}] backend HTTP ${res.status} ${res.ok ? '(ok)' : '(NOT ok)'}`)
-      log(`[${ms()}] backend response body:`, body)
+      const body = await res.json().catch(() => ({}))
+      console.log(`[switch] backend HTTP ${res.status}`, body?.email ?? '')
 
       if (!res.ok) throw new Error(body.detail || `Switch failed (HTTP ${res.status}).`)
-      if (!body.access_token || !body.refresh_token) {
-        err(`[${ms()}] response missing tokens`, body)
-        throw new Error('The server did not return a usable session.')
-      }
-      log(`[${ms()}] target account:`, {
-        email:   body.email   ?? '(none)',
-        role:    body.role    ?? '(none)',
-        user_id: body.user_id ?? '(none)',
-        accessTokenTail:  body.access_token.slice(-12),
-        refreshTokenTail: body.refresh_token.slice(-12),
-      })
 
-      // ── 3. Isolated client ───────────────────────────────────────────────
-      log(`[${ms()}] creating isolated supabase client…`)
-      const tmp = createClient(
-        SUPABASE_URL,
-        import.meta.env.VITE_SUPABASE_ANON_KEY,
-        { auth: { persistSession: true, autoRefreshToken: false, detectSessionInUrl: false } }
-      )
-      log(`[${ms()}] isolated client created.`, {
-        storageKey:       tmp.auth.storageKey,
-        matchesShared:    tmp.auth.storageKey === supabase.auth.storageKey,
-        ownSubscribers:   tmp.auth.stateChangeEmitters?.size,
-        sharedSubscribers: supabase.auth.stateChangeEmitters?.size,
-        hasBroadcastChannel: !!tmp.auth.broadcastChannel,
-        sharedHasBroadcastChannel: !!supabase.auth.broadcastChannel,
-      })
-      if (tmp.auth.broadcastChannel && supabase.auth.broadcastChannel) {
-        warn(`[${ms()}] BOTH clients have a BroadcastChannel named "${tmp.auth.storageKey}" — ` +
-             'the isolated client is NOT isolated; its SIGNED_IN will be rebroadcast ' +
-             'to the shared client. Watch for a PROBE line next.')
-      }
+      const written = writeSessionToStorage(body.session)
+      console.log('[switch] session written to', written.key, '→', written.email ?? written.userId)
 
-      // ── 4. setSession on the isolated client ─────────────────────────────
-      const tSet = performance.now()
-      log(`[${ms()}] calling setSession on isolated client…`)
-      const { data: setData, error: setErr } = await tmp.auth.setSession({
-        access_token:  body.access_token,
-        refresh_token: body.refresh_token,
-      })
-      const setMs = Math.round(performance.now() - tSet)
-      log(`[${ms()}] setSession returned after ${setMs}ms`)
-      if (setErr) {
-        err(`[${ms()}] setSession error:`, setErr)
-        throw new Error(setErr.message || 'Could not store the new session.')
-      }
-      log(`[${ms()}] setSession result user:`, {
-        userId:    setData?.session?.user?.id    ?? '(none)',
-        userEmail: setData?.session?.user?.email ?? '(none)',
-      })
-
-      // ── 5. Did it actually reach storage? ────────────────────────────────
-      const after = readStoredSession(storageKey)
-      log(`[${ms()}] stored session AFTER:`, after)
-      if (after.userId && body.user_id && after.userId === body.user_id) {
-        log(`[${ms()}] ✅ storage now holds the TARGET user (${after.userEmail})`)
-      } else {
-        warn(`[${ms()}] ⚠️ storage does NOT hold the target user — ` +
-             `expected ${body.user_id}, found ${after.userId ?? '(none)'}`)
-      }
-
-      // ── 6. What does the shared client think now? ────────────────────────
-      const { data: sharedNow } = await supabase.auth.getSession()
-      log(`[${ms()}] shared client session AFTER setSession:`, {
-        userId:    sharedNow?.session?.user?.id    ?? '(none)',
-        userEmail: sharedNow?.session?.user?.email ?? '(none)',
-        tokenTail: (sharedNow?.session?.access_token ?? '').slice(-12),
-        note: 'if this is still the OLD user while a PROBE fired for the NEW user, ' +
-              'that mismatch is what makes the role lookup fail under RLS',
-      })
-
-      // ── 7. Deliberate pause so the console can be read/screenshotted ─────
-      log(`[${ms()}] ⏳ waiting ${SWITCH_DEBUG_DELAY_MS / 1000}s so logs can be read ` +
-          '— screenshot the console NOW (enable "Preserve log" to keep it across the reload)')
-      await new Promise(r => setTimeout(r, SWITCH_DEBUG_DELAY_MS))
-
-      log(`[${ms()}] stored session immediately BEFORE navigation:`, readStoredSession(storageKey))
-      detachProbe()
-      log(`[${ms()}] navigating to /clients via window.location.replace …`)
-      log('════════ SWITCH END ════════')
+      console.log('[switch] reloading as the new user…')
       window.location.replace('/clients')
     } catch (e) {
-      err('FAILED:', e)
-      err('stored session at failure:', readStoredSession(storageKey))
-      detachProbe()
+      // Nothing above touches the shared client's session, so the current login
+      // is untouched by a failure — only the message needs showing.
+      console.error('[switch] FAILED:', e)
       setSwitchError(e.message || 'Switch failed')
       setSwitchingTo(null)
     }
