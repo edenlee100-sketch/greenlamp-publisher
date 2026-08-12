@@ -168,6 +168,7 @@ function TaskTableLayout({
   articles, pendingClientIds, clients, deletingId,
   onNavigate, onDelete, onRowClick, popup, setPopup,
   tableTitle, tableColumns, renderRow, renderPopup,
+  titleExtra, emptyMessage,
 }) {
   return (
     <div className="or-clients-layout">
@@ -176,16 +177,25 @@ function TaskTableLayout({
         <div className="clients-col-title pending">
           {tableTitle}
           <span className="pending-count">{articles.length}</span>
+          {/* Optional controls beside the heading. Only Or passes this; Denise
+              and the Publisher render exactly as before. */}
+          {titleExtra}
         </div>
         <div className="pending-table-wrap">
-          <table className="pending-articles-table">
-            <thead>
-              <tr>{tableColumns.map(col => <th key={col}>{col}</th>)}</tr>
-            </thead>
-            <tbody>
-              {articles.map((article, i) => renderRow(article, i))}
-            </tbody>
-          </table>
+          {articles.length === 0 ? (
+            // Unreachable for Denise/Publisher — they only mount this layout
+            // when there is at least one article.
+            <p className="empty-tasks">{emptyMessage ?? 'No active tasks'}</p>
+          ) : (
+            <table className="pending-articles-table">
+              <thead>
+                <tr>{tableColumns.map(col => <th key={col}>{col}</th>)}</tr>
+              </thead>
+              <tbody>
+                {articles.map((article, i) => renderRow(article, i))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 
@@ -231,6 +241,14 @@ export default function ClientsPage() {
   const [publisherArticles, setPublisherArticles] = useState([])
   // Denise — approved "other" articles assigned to her
   const [deniseArticles,    setDeniseArticles]    = useState([])
+
+  // Or can also look at the Publisher's and Denise's task tables from his own
+  // page. These are separate from publisherArticles/deniseArticles so the
+  // fetchers above keep their role guards and those roles' data paths are
+  // untouched.
+  const [orView,            setOrView]            = useState('attention')
+  const [orPublisherTasks,  setOrPublisherTasks]  = useState([])
+  const [orDeniseTasks,     setOrDeniseTasks]     = useState([])
 
   const [popup, setPopup] = useState(null)   // { article, x, y, role }
 
@@ -457,6 +475,39 @@ export default function ClientsPage() {
 
   useEffect(() => { refreshPublisherArticles() }, [refreshPublisherArticles])
 
+  // ── Or: the Publisher's and Denise's queues, for his view switcher ──────────
+  // Same queries and same filter as the two fetchers above, so the tables show
+  // exactly what those roles see. Deliberately does NOT touch pendingClientIds
+  // — that is derived from whichever list is on screen (see orTable below).
+
+  const refreshOrPublisherTasks = useCallback(async () => {
+    if (role !== 'or') return
+    const { data } = await supabase
+      .from('articles')
+      .select('id, client_id, status, created_at, magazine, google_doc_url, chosen_publisher, preferred_publisher, assigned_to, clients(name)')
+      .eq('status', 'approved')
+      .order('created_at', { ascending: true })
+    setOrPublisherTasks((data ?? []).filter(a =>
+      !isOtherPub(a.chosen_publisher || a.preferred_publisher) ||
+      a.assigned_to === 'publisher'
+    ))
+  }, [role])
+
+  useEffect(() => { refreshOrPublisherTasks() }, [refreshOrPublisherTasks])
+
+  const refreshOrDeniseTasks = useCallback(async () => {
+    if (role !== 'or') return
+    const { data } = await supabase
+      .from('articles')
+      .select('id, client_id, status, created_at, magazine, google_doc_url, clients(name)')
+      .eq('status', 'approved')
+      .eq('assigned_to', 'denise')
+      .order('created_at', { ascending: true })
+    setOrDeniseTasks(data ?? [])
+  }, [role])
+
+  useEffect(() => { refreshOrDeniseTasks() }, [refreshOrDeniseTasks])
+
   // ── Realtime: keep tables accurate ───────────────────────────────────────────
 
   useEffect(() => {
@@ -464,13 +515,19 @@ export default function ClientsPage() {
     const channel = supabase
       .channel('articles-pending-indicators')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'articles' }, () => {
-        if (role === 'or')        refreshOrArticles()
+        if (role === 'or') {
+          refreshOrArticles()
+          // Or's other two views must stay live as well, whichever is selected.
+          refreshOrPublisherTasks()
+          refreshOrDeniseTasks()
+        }
         else if (role === 'publisher') refreshPublisherArticles()
         else if (role === 'denise')    refreshDeniseArticles()
       })
       .subscribe()
     return () => { supabase.removeChannel(channel) }
-  }, [role, refreshOrArticles, refreshPublisherArticles, refreshDeniseArticles])
+  }, [role, refreshOrArticles, refreshPublisherArticles, refreshDeniseArticles,
+      refreshOrPublisherTasks, refreshOrDeniseTasks])
 
   // ── Magazine search: suggestions while typing ───────────────────────────────
 
@@ -661,6 +718,56 @@ export default function ClientsPage() {
       </tr>
     )
   }
+
+  // ── Or's view switcher ──────────────────────────────────────────────────────
+  // Each option feeds the shared TaskTableLayout the same articles, columns and
+  // row renderer that the owning role's own page uses, so the three tables stay
+  // in sync automatically.
+  const OR_VIEWS = {
+    attention: {
+      label:     'Needs attention',
+      title:     'Needs attention',
+      articles:  pendingArticles,
+      columns:   ['#', 'Client', 'Submitted', 'Magazine', 'Doc', 'Publisher', 'Prices'],
+      renderRow: renderOrRow,
+    },
+    publisher: {
+      label:     'Publisher tasks',
+      title:     'To send',
+      articles:  orPublisherTasks,
+      columns:   ['#', 'Client', 'Magazine', 'Doc', 'Publisher', 'Submitted'],
+      renderRow: renderPublisherRow,
+    },
+    denise: {
+      label:     'Denise tasks',
+      title:     'To send',
+      articles:  orDeniseTasks,
+      columns:   ['#', 'Client', 'Magazine', 'Doc', 'Publisher', 'Submitted'],
+      renderRow: renderDeniseRow,
+    },
+  }
+
+  const orTable = (() => {
+    const view = OR_VIEWS[orView] ?? OR_VIEWS.attention
+    return { ...view, clientIds: new Set(view.articles.map(a => a.client_id)) }
+  })()
+
+  const orViewFilters = (
+    <span className="or-view-filters">
+      {Object.entries(OR_VIEWS).map(([key, view]) => (
+        <button
+          key={key}
+          type="button"
+          data-view={key}
+          className={`status-filter-btn${orView === key ? ' active' : ''}`}
+          onClick={() => setOrView(key)}
+        >
+          {view.label}
+          <span className="filter-count">{view.articles.length}</span>
+        </button>
+      ))}
+    </span>
+  )
 
   return (
     <Layout title="Clients">
@@ -945,17 +1052,19 @@ export default function ClientsPage() {
       {/* ── Role-based layouts (hidden while magazine search or pending-publication is active) ── */}
       {!loading && !magSelected && !pendingPubOpen && <>
 
-      {/* ── Or layout ── */}
-      {role === 'or' && pendingArticles.length === 0 && (
-        <ClientFoldersGrid {...folderProps} />
-      )}
-      {role === 'or' && pendingArticles.length > 0 && (
+      {/* ── Or layout: one table, switchable between the three queues ── */}
+      {role === 'or' && (
         <TaskTableLayout
-          articles={pendingArticles}
-          tableTitle="Needs attention"
-          tableColumns={['#', 'Client', 'Submitted', 'Magazine', 'Doc', 'Publisher', 'Prices']}
-          renderRow={renderOrRow}
+          articles={orTable.articles}
+          tableTitle={orTable.title}
+          tableColumns={orTable.columns}
+          renderRow={orTable.renderRow}
+          titleExtra={orViewFilters}
+          emptyMessage="No active tasks"
           {...folderProps}
+          // Highlight the folders belonging to whatever is on screen. For the
+          // default view this is the same set as before.
+          pendingClientIds={orTable.clientIds}
         />
       )}
 

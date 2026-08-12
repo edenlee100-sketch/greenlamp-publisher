@@ -1188,6 +1188,33 @@ body {
   .clients-split { flex-direction: column; }
 }
 
+/* ── Or's task-table view switcher ── */
+/* Scoped to .or-view-filters so the shared .clients-col-title used by Denise's
+   and the Publisher's headings is untouched. */
+.or-view-filters {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: 14px;
+  vertical-align: middle;
+}
+.or-view-filters .status-filter-btn {
+  text-transform: none;
+  letter-spacing: normal;
+}
+.or-view-filters .status-filter-btn[data-view="attention"].active { background: #dc2626; }
+.or-view-filters .status-filter-btn[data-view="publisher"].active { background: #1E8449; }
+.or-view-filters .status-filter-btn[data-view="denise"].active    { background: #1A6EA0; }
+
+.empty-tasks {
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 18px 2px;
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+}
+
 /* ── Or two-column layout ── */
 .or-clients-layout {
   display: flex;
